@@ -1,438 +1,254 @@
 import numpy as np
-import torch
-import torch.nn as nn
-import torch.optim as optim
+from tensorflow import keras
+import tensorflow as tf
+from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
+from tensorflow.keras.models import load_model
 from sklearn.metrics import precision_score
-from torch.utils.data import DataLoader, TensorDataset
-from torch.nn.functional import one_hot
-from torch.utils.data import DataLoader
-import torch.nn.functional as F
 
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+class BatchAgentLalEnv(object):
 
-class LalEnv(object):
-
-    def __init__(self, dataset, model, epochs, classifier_batch_size, target_precision):
-
-        # Define the device and move model to device
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
+    def __init__(self, dataset, epochs, classifier_batch_size):
+        
+        # Initialize the environment with attributes: dataset, model, quality function and other attributes.
         self.dataset = dataset
-        self.model = model
+        self.model = load_model('./classifiers/classifier_batch_agent.h5')
         self.epochs = epochs
-        self.classifier_batch_size = classifier_batch_size
-        self.target_precision = target_precision
-        self.number_of_classes = np.size(np.unique(self.dataset.state_labels))
-        self.episode_qualities = []
-        self.rewards_bank = []
-        self.batch_bank = []
-        self.precision_bank = []
-
-    def reset(self, number_of_first_samples=10, code_state="", target_precision=0.0, target_budget=1.0):
+        self.classifier_batch_size = classifier_batch_size  
+        self.number_of_classes = np.size(np.unique(self.dataset.train_labels)) # # The number of classes as a number of unique labels in the train dataset.    
+        self.episode_qualities = [] # A list where testing quality at each iteration will be written.
+        self.episode_losses= [] # A list where loss for testing at each iteration will be written:
+        self.episode_training_qualities = [] # A list where training quality at each iteration will be written:
+        self.episode_training_losses = [] # A list where training loss at each iteration will be written.
+        self.rewards_bank = [] # Rewards bank to store the rewards.
+        self.batch_bank = [] # Batch bank to store the batch size.
+        self.precision_bank = [] # Precision bank to store the precision per class.
+    
+    def reset(self, number_of_first_samples=10):
+        
+        self.model = load_model('./classifiers/classifier_batch_agent.h5')
+        
+        # Sample initial data points.
         self.dataset.regenerate()
         self.episode_qualities.append(0)
         self.rewards_bank.append(0)
         self.batch_bank.append(0.1)
         self.precision_bank.append(0)
-        self.code_state = code_state
-        self.target_precision = target_precision
-        self.target_budget = target_budget
-
-        if self.code_state == "Warm-Start":
-            if number_of_first_samples < self.number_of_classes:
-                print(f'number_of_first_samples {number_of_first_samples} is less than the number of classes {self.number_of_classes}, so we change it.')
-                number_of_first_samples = self.number_of_classes
-
-            self.indices_known = []
-            self.indices_unknown = []
-            for i in np.unique(self.dataset.warm_start_labels.numpy()):  # Convert torch.Tensor to numpy array.
-                cl = np.nonzero(self.dataset.warm_start_labels.numpy() == i)[0]
-                indices = np.random.permutation(cl)
-                self.indices_known.append(indices[0])
-                self.indices_unknown.extend(indices[1:])
-            self.indices_known = np.array(self.indices_known)
-            self.indices_unknown = np.array(self.indices_unknown)
-            self.indices_unknown = np.random.permutation(self.indices_unknown)
-
-            if number_of_first_samples > self.number_of_classes:
-                self.indices_known = np.concatenate(
-                    (self.indices_known, self.indices_unknown[:number_of_first_samples - self.number_of_classes]))
-                self.indices_unknown = self.indices_unknown[number_of_first_samples - self.number_of_classes:]
-
-            known_data = self.dataset.warm_start_data[self.indices_known, :]
-            known_labels = self.dataset.warm_start_labels[self.indices_known]
-            known_labels_one_hot_encoding = one_hot(torch.tensor(known_labels),
-                                                    num_classes=self.dataset.number_of_classes).float()
-
-            train_loader = DataLoader(TensorDataset(torch.tensor(known_data).float().to(self.device), known_labels_one_hot_encoding.to(self.device)),
-                            batch_size=self.classifier_batch_size, shuffle=True)
-
-            self.model.train()
-            optimizer = optim.Adam(self.model.parameters())
-            criterion = nn.CrossEntropyLoss()
-
-            best_val_acc = 0
-            patience_counter = 0
-            for epoch in range(self.epochs):
-                epoch_loss = 0
-                for batch_data, batch_labels in train_loader:
-                    batch_data, batch_labels = batch_data.to(self.device), batch_labels.to(self.device)
-                    batch_data = batch_data.permute(0, 3, 1, 2).flatten(1, 2)  # This is where the correction is made
-                    optimizer.zero_grad()
-                    outputs = self.model(batch_data)
-                    loss = criterion(outputs, batch_labels)
-                    loss.backward()
-                    optimizer.step()
-                    epoch_loss += loss.item()
-
-                val_acc = self._evaluate_model()
-                if val_acc > best_val_acc:
-                    best_val_acc = val_acc
-                    torch.save(self.model.state_dict(), 'best_model.pth')
-                    patience_counter = 0
-                else:
-                    patience_counter += 1
-                    if patience_counter > 5:
-                        self.model.load_state_dict(torch.load('best_model.pth'))
-                        break
-
-            self.model.eval()
-            with torch.no_grad():
-                predictions = self.model(torch.tensor(self.dataset.test_data).float().permute(0, 3, 1, 2).to(self.device))
-                predicted_labels = torch.argmax(predictions, dim=1).cpu().numpy()
-                test_labels_one_hot_encoding = one_hot(torch.tensor(self.dataset.test_labels),
-                                                    num_classes=self.dataset.number_of_classes).float()
-                true_labels = np.argmax(test_labels_one_hot_encoding, axis=1)
-                precision_scores = precision_score(true_labels, predicted_labels, average='weighted', zero_division=0)
-
-            self.episode_qualities.append(best_val_acc)
-            self.precision_bank.append(precision_scores)
-            self.batch_bank.append(number_of_first_samples / len(self.dataset.warm_start_data))
+        self.episode_losses.append(2)
         
-        elif self.code_state == "Agent":
-            if number_of_first_samples < self.number_of_classes:
-                print(f'number_of_first_samples {number_of_first_samples} is less than the number of classes {self.number_of_classes}, so we change it.')
-                number_of_first_samples = self.number_of_classes
+        # To train an initial classifier we need at least self.number_of_classes samples.
+        if number_of_first_samples < self.number_of_classes:
+            print('number_of_first_samples', number_of_first_samples, ' number of points is less than the number of classes', self.number_of_classes, ', so we change it.')
+            number_of_first_samples = self.number_of_classes
+        
+        # Sample number_of_first_samples data points.
+        self.indices_known = []
+        self.indices_unknown = []
+        
+        for i in np.unique(self.dataset.train_labels):
+            
+            # First get 1 point from each class.
+            cl = np.nonzero(self.dataset.train_labels==i)[0]
+            
+            # Ensure that we select random data points.
+            indices = np.random.permutation(cl)
+            self.indices_known.append(indices[0])
+            self.indices_unknown.extend(indices[1:])
+        self.indices_known = np.array(self.indices_known)
+        self.indices_unknown = np.array(self.indices_unknown)
+        
+        # The self.indices_unknown now contains first all points of class_1, then all points of class_2 etc.
+        # So, we permute them.
+        self.indices_unknown = np.random.permutation(self.indices_unknown)
+        
+        # Then, sample the rest of the data points at random.
+        if number_of_first_samples > self.number_of_classes:
+            self.indices_known = np.concatenate(([self.indices_known, self.indices_unknown[0:number_of_first_samples-self.number_of_classes]]))
+            self.indices_unknown = self.indices_unknown[number_of_first_samples-self.number_of_classes:]
+        
+        # BUILD AN INITIAL MODEL.
+        # Get the data corresponding to the selected indices.
+        known_data = self.dataset.train_data[self.indices_known,:]
+        
+        #print("known_data", known_data)
+        known_labels = self.dataset.train_labels[self.indices_known]
+        
+        #print("known_labels", known_labels)
+        unknown_data = self.dataset.train_data[self.indices_unknown,:]
+        unknown_labels = self.dataset.train_labels[self.indices_unknown]
+        known_labels_one_hot_encoding = keras.utils.to_categorical(known_labels, num_classes = self.dataset.number_of_classes)
+        
+        # Train a model using data corresponding to indices_known:
+        early_stopping = EarlyStopping(monitor='val_accuracy', patience=5, restore_best_weights=True)
+        checkpoint = ModelCheckpoint('weights.h5', monitor='val_accuracy', verbose=0, save_best_only=True, mode='max')
+        callbacks = [early_stopping, checkpoint]
+        self.model._ckpt_saved_epoch = 0
+        history = self.model.fit(known_data, known_labels_one_hot_encoding, batch_size=self.classifier_batch_size, epochs=self.epochs, verbose=0,
+                                 validation_data=(self.dataset.test_data, self.dataset.test_labels_one_hot_encoding), callbacks=callbacks)
+        # Testing accuracy.
+        new_score = history.history['val_accuracy'][-1]
+        self.episode_qualities.append(new_score)
+        
+        # Compute the precision:
+        predictions = self.model.predict(self.dataset.test_data)
+        predicted_labels = np.argmax(predictions, axis=1)
+        true_labels = np.argmax(self.dataset.test_labels_one_hot_encoding, axis=1)
+        precision_scores = precision_score(true_labels, predicted_labels, average='weighted', zero_division=0)
+        self.precision_bank.append(precision_scores)
 
-            self.indices_known = []
-            self.indices_unknown = []
-            for i in np.unique(self.dataset.agent_labels.numpy()):  # Convert torch.Tensor to numpy array.
-                cl = np.nonzero(self.dataset.agent_labels.numpy() == i)[0]
-                indices = np.random.permutation(cl)
-                self.indices_known.append(indices[0])
-                self.indices_unknown.extend(indices[1:])
-            self.indices_known = np.array(self.indices_known)
-            self.indices_unknown = np.array(self.indices_unknown)
-            self.indices_unknown = np.random.permutation(self.indices_unknown)
+        # Batch.
+        self.batch_bank.append(number_of_first_samples/len(self.dataset.train_data))
 
-            if number_of_first_samples > self.number_of_classes:
-                self.indices_known = np.concatenate(
-                    (self.indices_known, self.indices_unknown[:number_of_first_samples - self.number_of_classes]))
-                self.indices_unknown = self.indices_unknown[number_of_first_samples - self.number_of_classes:]
+        # Testing loss.
+        self.episode_losses.append(history.history['val_loss'][-1])
 
-            known_data = self.dataset.agent_data[self.indices_known, :]
-            known_labels = self.dataset.agent_labels[self.indices_known]
-            known_labels_one_hot_encoding = one_hot(torch.tensor(known_labels),
-                                                    num_classes=self.dataset.number_of_classes).float()
+        # Training accuracy.
+        self.episode_training_qualities.append(history.history['accuracy'][-1])
+        
+        # Training loss.
+        self.episode_training_losses.append(history.history['loss'][-1])
 
-            train_loader = DataLoader(TensorDataset(torch.tensor(known_data).float().to(self.device), known_labels_one_hot_encoding.to(self.device)),
-                            batch_size=self.classifier_batch_size, shuffle=True)
-
-            self.model.train()
-            optimizer = optim.Adam(self.model.parameters())
-            criterion = nn.CrossEntropyLoss()
-
-            best_val_acc = 0
-            patience_counter = 0
-            for epoch in range(self.epochs):
-                epoch_loss = 0
-                for batch_data, batch_labels in train_loader:
-                    batch_data, batch_labels = batch_data.to(self.device), batch_labels.to(self.device)
-                    batch_data = batch_data.permute(0, 3, 1, 2).flatten(1, 2)  # This is where the correction is made
-                    optimizer.zero_grad()
-                    outputs = self.model(batch_data)
-                    loss = criterion(outputs, batch_labels)
-                    loss.backward()
-                    optimizer.step()
-                    epoch_loss += loss.item()
-
-                val_acc = self._evaluate_model()
-                if val_acc > best_val_acc:
-                    best_val_acc = val_acc
-                    torch.save(self.model.state_dict(), 'best_model.pth')
-                    patience_counter = 0
-                else:
-                    patience_counter += 1
-                    if patience_counter > 5:
-                        self.model.load_state_dict(torch.load('best_model.pth'))
-                        break
-
-            self.model.eval()
-            with torch.no_grad():
-                predictions = self.model(torch.tensor(self.dataset.test_data).float().permute(0, 3, 1, 2).to(self.device))
-                predicted_labels = torch.argmax(predictions, dim=1).cpu().numpy()
-                test_labels_one_hot_encoding = one_hot(torch.tensor(self.dataset.test_labels),
-                                                    num_classes=self.dataset.number_of_classes).float()
-                true_labels = np.argmax(test_labels_one_hot_encoding, axis=1)
-                precision_scores = precision_score(true_labels, predicted_labels, average='weighted', zero_division=0)
-
-            self.episode_qualities.append(best_val_acc)
-            self.precision_bank.append(precision_scores)
-            self.batch_bank.append(number_of_first_samples / len(self.dataset.agent_data))
-
+        # Get the features categorizing the state.
         state, next_action = self._get_state()
         self.n_actions = np.size(self.indices_unknown)
-
+        self.model.save('./classifiers/classifier_batch_agent.h5')
         return state, next_action
-
-    def step(self, batch_actions_indices):
-        # The batch_actions_indices value indicates the positions
-        # of the batch of data points in self.indices_unknown that we want to sample in unknown_data.
-        # The index in train_data should be retrieved.
-
-        if self.code_state == "Warm-Start":
-
+        
+    def step(self, batch=0, batch_actions_indices=[], isBatchAgent=False):
+        
+        self.isBatchAgent = isBatchAgent
+        
+        if self.isBatchAgent:
+            self.model = load_model('./classifiers/classifier_batch_agent.h5')
+            train_predictions = self.model.predict(self.dataset.train_data[self.indices_unknown,:])
+            uncertainty_scores = np.min(train_predictions, axis=1)
+            sorted_indices = np.argsort(uncertainty_scores)[:batch]
+            
+            # Label a datapoint: add its index to known samples and remove from unknown.
+            self.indices_known = np.concatenate((self.indices_known, sorted_indices))
+            self.indices_unknown = np.delete(self.indices_unknown, sorted_indices)
+            
+            # Train a model with new labeled data:
+            known_data = self.dataset.train_data[self.indices_known,:]
+            known_labels = self.dataset.train_labels[self.indices_known]
+            known_labels_one_hot_encoding = keras.utils.to_categorical(known_labels, num_classes = self.dataset.number_of_classes)
+        
+        else:
+            self.model = load_model('./classifiers/classifier_batch_agent.h5')
+            
+            # The batch_actions_indices value indicates the positions
+            # of the batch of data points in self.indices_unknown that we want to sample in unknown_data.
+            # The index in train_data should be retrieved.
             selection_absolute = self.indices_unknown[batch_actions_indices]
-            self.indices_known = self.indices_known.flatten()
-            selection_absolute = selection_absolute.flatten()
+            
+            # Label a datapoint: add its index to known samples and remove from unknown.
             self.indices_known = np.concatenate((self.indices_known, selection_absolute))
             self.indices_unknown = np.delete(self.indices_unknown, batch_actions_indices)
+            
             # Train a model with new labeled data:
-            known_data = self.dataset.warm_start_data[self.indices_known, :]
-            known_labels = self.dataset.warm_start_labels[self.indices_known]
-            known_labels_one_hot_encoding = one_hot(torch.tensor(known_labels),
-                                                    num_classes=self.dataset.number_of_classes).float()
-
-            train_loader = DataLoader(TensorDataset(torch.tensor(known_data).float(), known_labels_one_hot_encoding),
-                                    batch_size=self.classifier_batch_size, shuffle=True)
-
-            self.model.train()
-            optimizer = optim.Adam(self.model.parameters())
-            criterion = nn.CrossEntropyLoss()
-
-            best_val_acc = 0
-            patience_counter = 0
-            for epoch in range(self.epochs):
-                epoch_loss = 0
-                for batch_data, batch_labels in train_loader:
-                    batch_data, batch_labels = batch_data.to(self.device), batch_labels.to(self.device)
-                    batch_data = batch_data.permute(0, 3, 1, 2).flatten(1, 2)  # This is where the correction is made
-                    optimizer.zero_grad()
-                    outputs = self.model(batch_data)
-                    loss = criterion(outputs, batch_labels)
-                    loss.backward()
-                    optimizer.step()
-                    epoch_loss += loss.item()
-
-                val_acc = self._evaluate_model()
-                if val_acc > best_val_acc:
-                    best_val_acc = val_acc
-                    torch.save(self.model.state_dict(), 'best_model.pth')
-                    patience_counter = 0
-                else:
-                    patience_counter += 1
-                    if patience_counter > 5:
-                        self.model.load_state_dict(torch.load('best_model.pth'))
-                        break
-
-            # Compute the quality of the current classifier.
-            new_score = best_val_acc  # Testing accuracy.
-            self.episode_qualities.append(new_score)
-
-            # Compute the precision:
-            self.model.eval()
-            with torch.no_grad():
-                predictions = self.model(torch.tensor(self.dataset.test_data).float().permute(0, 3, 1, 2).to(self.device))            
-                predicted_labels = torch.argmax(predictions, dim=1).cpu().numpy()
-                test_labels_one_hot_encoding = one_hot(torch.tensor(self.dataset.test_labels),
-                                                    num_classes=self.dataset.number_of_classes).float()
-                true_labels = np.argmax(test_labels_one_hot_encoding, axis=1)
-                precision_scores = precision_score(true_labels, predicted_labels, average='weighted', zero_division=0)
-
-            self.precision_bank.append(precision_scores)
-
-            # Update batch bank and training losses.
-            self.batch_bank.append(len(batch_actions_indices) / len(self.dataset.warm_start_data))
-    
-            # Get the new state and the next action.
-            state, next_action = self._get_state()
-
-            # Compute the reward.
-            reward = self._compute_reward()
-
-            # Check if this episode terminated.
-            done = self._compute_is_terminal()
-
-            if isinstance(state, torch.Tensor):
-                state = state.cpu()
-            if isinstance(next_action, torch.Tensor):
-                next_action = next_action.cpu()
-            if isinstance(reward, torch.Tensor):
-                reward = reward.cpu()
-            if isinstance(done, torch.Tensor):
-                done = done.cpu()
-
-        if self.code_state == "Agent":
-
-            selection_absolute = self.indices_unknown[batch_actions_indices]
-            self.indices_known = self.indices_known.flatten()
-            selection_absolute = selection_absolute.flatten()
-            self.indices_known = np.concatenate((self.indices_known, selection_absolute))
-            self.indices_unknown = np.delete(self.indices_unknown, batch_actions_indices)
-            # Train a model with new labeled data:
-            known_data = self.dataset.agent_data[self.indices_known, :]
-            known_labels = self.dataset.agent_labels[self.indices_known]
-            known_labels_one_hot_encoding = one_hot(torch.tensor(known_labels),
-                                                    num_classes=self.dataset.number_of_classes).float()
-
-            train_loader = DataLoader(TensorDataset(torch.tensor(known_data).float(), known_labels_one_hot_encoding),
-                                    batch_size=self.classifier_batch_size, shuffle=True)
-
-            self.model.train()
-            optimizer = optim.Adam(self.model.parameters())
-            criterion = nn.CrossEntropyLoss()
-
-            best_val_acc = 0
-            patience_counter = 0
-            for epoch in range(self.epochs):
-                epoch_loss = 0
-                for batch_data, batch_labels in train_loader:
-                    batch_data, batch_labels = batch_data.to(self.device), batch_labels.to(self.device)
-                    batch_data = batch_data.permute(0, 3, 1, 2).flatten(1, 2)  # This is where the correction is made
-                    optimizer.zero_grad()
-                    outputs = self.model(batch_data)
-                    loss = criterion(outputs, batch_labels)
-                    loss.backward()
-                    optimizer.step()
-                    epoch_loss += loss.item()
-
-                val_acc = self._evaluate_model()
-                if val_acc > best_val_acc:
-                    best_val_acc = val_acc
-                    torch.save(self.model.state_dict(), 'best_model.pth')
-                    patience_counter = 0
-                else:
-                    patience_counter += 1
-                    if patience_counter > 5:
-                        self.model.load_state_dict(torch.load('best_model.pth'))
-                        break
-
-            # Compute the quality of the current classifier.
-            new_score = best_val_acc  # Testing accuracy.
-            self.episode_qualities.append(new_score)
-
-            # Compute the precision:
-            self.model.eval()
-            with torch.no_grad():
-                predictions = self.model(torch.tensor(self.dataset.test_data).float().permute(0, 3, 1, 2).to(self.device))            
-                predicted_labels = torch.argmax(predictions, dim=1).cpu().numpy()
-                test_labels_one_hot_encoding = one_hot(torch.tensor(self.dataset.test_labels),
-                                                    num_classes=self.dataset.number_of_classes).float()
-                true_labels = np.argmax(test_labels_one_hot_encoding, axis=1)
-                precision_scores = precision_score(true_labels, predicted_labels, average='weighted', zero_division=0)
-
-            self.precision_bank.append(precision_scores)
-
-            # Update batch bank and training losses.
-            self.batch_bank.append(len(batch_actions_indices) / len(self.dataset.agent_data))
-    
-            # Get the new state and the next action.
-            state, next_action = self._get_state()
-
-            # Compute the reward.
-            reward = self._compute_reward()
-
-            # Check if this episode terminated.
-            done = self._compute_is_terminal()
-
-            if isinstance(state, torch.Tensor):
-                state = state.cpu()
-            if isinstance(next_action, torch.Tensor):
-                next_action = next_action.cpu()
-            if isinstance(reward, torch.Tensor):
-                reward = reward.cpu()
-            if isinstance(done, torch.Tensor):
-                done = done.cpu()
-
-        return state, next_action, self.indices_unknown, reward, done
-
+            known_data = self.dataset.train_data[self.indices_known,:]
+            known_labels = self.dataset.train_labels[self.indices_known]
+            known_labels_one_hot_encoding = keras.utils.to_categorical(known_labels, num_classes = self.dataset.number_of_classes)
+        
+        early_stopping = EarlyStopping(monitor='val_accuracy', patience=5, restore_best_weights=True)
+        checkpoint = ModelCheckpoint('weights.h5', monitor='val_accuracy', verbose=0, save_best_only=True, mode='max')
+        callbacks = [early_stopping, checkpoint]
+        self.model._ckpt_saved_epoch = 0
+        history = self.model.fit(known_data, known_labels_one_hot_encoding, batch_size=self.classifier_batch_size, epochs=self.epochs, verbose=0,
+                                 validation_data=(self.dataset.test_data, self.dataset.test_labels_one_hot_encoding), callbacks=callbacks)
+        # Get a new state.
+        state, next_action = self._get_state()
+        
+        # Update the number of available actions.
+        self.n_actions = np.size(self.indices_unknown)
+        
+        # Compute the quality of the current classifier.
+        new_score = history.history['val_accuracy'][-1] # Testing accuracy.
+        self.episode_qualities.append(new_score)
+        
+        # Compute the precision:
+        predictions = self.model.predict(self.dataset.test_data)
+        predicted_labels = np.argmax(predictions, axis=1)
+        true_labels = np.argmax(self.dataset.test_labels_one_hot_encoding, axis=1)
+        precision_scores = precision_score(true_labels, predicted_labels, average='weighted', zero_division=0)
+        self.precision_bank.append(precision_scores)
+        self.batch_bank.append(len(batch_actions_indices)/len(self.dataset.train_data)) # Batch.
+        self.episode_losses.append(history.history['val_loss'][-1]) # Testing loss.
+        self.episode_training_qualities.append(history.history['accuracy'][-1]) # Training accuracy.
+        self.episode_training_losses.append(history.history['loss'][-1]) # Training loss.
+        
+        # Compute the reward.
+        reward = self._compute_reward()
+        
+        # Check if this episode terminated.
+        done = self._compute_is_terminal()
+        self.model.save('./classifiers/classifier_batch_agent.h5')
+        return state, next_action, reward, done
+      
     def _get_state(self):
-        with torch.no_grad():
-            predictions = self.model(torch.tensor(self.dataset.state_data).float().permute(0, 3, 1, 2).to(self.device)).cpu().numpy()[:, 0]            
-            idx = np.argsort(predictions)
-            state = predictions[idx]
-        # Compute next_action.
-        if self.code_state == "Warm-Start":
-            unknown_data = self.dataset.warm_start_data[self.indices_unknown,:]
-        elif self.code_state == "Agent":
-            unknown_data = self.dataset.agent_data[self.indices_unknown,:]     
-        next_action = [np.array([i]) for i in range(1, len(unknown_data) + 1)]
-        self.n_actions = len(unknown_data)
-        return state, next_action
+        
+        # Compute current state. Use margin score.
+        predictions = self.model.predict(self.dataset.state_data)
+        predictions = np.array(predictions)
+        part = np.partition(-predictions, 1, axis=1)
+        margin = - part[:, 0] + part[:, 1]
+        idx = np.argsort(margin)
 
+        # The state representation is the "sorted" list of margin scores.
+        state = margin[idx]
+
+        # Compute next_action.
+        unknown_data = self.dataset.train_data[self.indices_unknown,:]
+        next_action = []
+        
+        for i in range(1, len(unknown_data)+1):
+            next_action.append(np.array([i]))
+            
+        return state, next_action
+    
     def _compute_reward(self):
+
         reward = 0.0
         return reward
-
+    
     def _compute_is_terminal(self):
-        done = self.n_actions == 0
+        # The self.n_actions contains a number of unlabeled data points that are left.
+        if self.n_actions==0:
+            print('We ran out of samples!')
+            done = True
+        else:
+            done = False
         return done
 
+class BatchAgentLalEnvFirstAccuracy(BatchAgentLalEnv): 
 
-class LalEnvFirstAccuracy(LalEnv):
-
-    def __init__(self, dataset, model, epochs, classifier_batch_size, target_precision):
-        super().__init__(dataset, model, epochs, classifier_batch_size, target_precision)
-
-    def reset(self, number_of_first_samples=10, code_state="", target_precision=0.0, target_budget=1.0):
-        state, next_action = super().reset(number_of_first_samples=number_of_first_samples, code_state=code_state, target_precision=target_precision,
-                                           target_budget=target_budget)
+    def __init__(self, dataset, epochs, classifier_batch_size):
+        # Initialize the environment with its normal attributes.
+        BatchAgentLalEnv.__init__(self, dataset, epochs, classifier_batch_size)
+    
+    def reset(self, number_of_first_samples=10):
+        
+        state, next_action = BatchAgentLalEnv.reset(self, number_of_first_samples=number_of_first_samples)
         current_reward = self._compute_reward()
+
+        # Store the current rewatd.
         self.rewards_bank.append(current_reward)
-        if isinstance(state, torch.Tensor):
-            state = state.cpu()
-        if isinstance(next_action, torch.Tensor):
-            next_action = next_action.cpu()
-        if isinstance(current_reward, torch.Tensor):
-            current_reward = current_reward.cpu()
-
-        return state, next_action, self.indices_unknown, current_reward
-
+        return state, next_action, current_reward
+       
     def _compute_reward(self):
-        new_score = self.precision_bank[-1] / self.batch_bank[-1]
-        previous_score = self.precision_bank[-2] / self.batch_bank[-2]
-        reward = new_score - previous_score + 0.01 * (1 - np.random.rand())
+        
+        # Find the reward as new_score - previous_score.
+        new_score = self.episode_qualities[-1] / self.batch_bank[-1]
+        previous_score = self.episode_qualities[-2] / self.batch_bank[-2]
+        reward = new_score - previous_score
         self.rewards_bank.append(reward)
         return reward
-
+    
     def _compute_is_terminal(self):
-        done = super()._compute_is_terminal()
-        percentage_precision = 100
-        percentage_budget = 50
-        if self.code_state!="Warm-Start":
-            if (((percentage_precision * self.target_precision) / 100) <= self.precision_bank[-1]) and (
-                    ((percentage_budget * self.target_budget) / 100) > self.batch_bank[-1]):
-                print("-- Exceed target precision with lower budget, so this is the end of the episode.")
+
+        # By default the episode will terminate when all samples are labelled.
+        done = BatchAgentLalEnv._compute_is_terminal(self)
+        if len(self.rewards_bank) >= 2:
+            if self.rewards_bank[-1] < self.rewards_bank[-2]:
                 done = True
-        else:
-            if len(self.rewards_bank) >= 4 and all(
-                    x < y for x, y in zip(self.rewards_bank[-3:], self.rewards_bank[-4:-1])):
-                done = True
+                return done
         return done
-
-    def return_episode_qualities(self):
-        return self.episode_qualities
-
-    def return_episode_precisions(self):
-        return self.precision_bank
-
-    def _evaluate_model(self):
-        self.model.eval()
-        with torch.no_grad():
-            predictions = self.model(torch.tensor(self.dataset.test_data).float().permute(0, 3, 1, 2).to(self.device))
-            predicted_labels = torch.argmax(predictions, dim=1).cpu().numpy()
-            test_labels_one_hot_encoding = one_hot(torch.tensor(self.dataset.test_labels), num_classes=self.dataset.number_of_classes).float()
-            true_labels = torch.tensor(np.argmax(test_labels_one_hot_encoding, axis=1)).to(self.device)
-            correct = (predicted_labels == true_labels.cpu().numpy()).sum()
-            accuracy = correct / len(true_labels)
-        return accuracy
